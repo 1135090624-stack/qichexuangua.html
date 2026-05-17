@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>双叉臂悬挂系统物理模拟</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #111;
+            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+        canvas {
+            background: linear-gradient(to bottom, #1a2a3a 0%, #2c3e50 100%);
+            border: 2px solid #444;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+            border-radius: 8px;
+        }
+        .panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #555;
+            pointer-events: none;
+        }
+        .panel h3 {
+            margin: 0 0 10px 0;
+            color: #f1c40f;
+            font-size: 16px;
+        }
+        .stat {
+            font-family: monospace;
+            font-size: 14px;
+            margin-bottom: 5px;
+            color: #ecf0f1;
+        }
+        .highlight { color: #e74c3c; font-weight: bold; }
+        .highlight-blue { color: #3498db; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <canvas id="simCanvas" width="1000" height="600"></canvas>
+    
+    <div class="panel">
+        <h3>实时遥测数据 (Telemetry)</h3>
+        <div class="stat" id="stat-speed">地形滚动速度: 0 km/h</div>
+        <div class="stat" id="stat-compress">弹簧形变 (x): 0.00 m</div>
+        <div class="stat" id="stat-spring">弹簧弹力 (F = -kx): <span class="highlight">0 N</span></div>
+        <div class="stat" id="stat-damper">阻尼力 (F = -cv): <span class="highlight-blue">0 N</span></div>
+    </div>
+
+<script>
+    const canvas = document.getElementById('simCanvas');
+    const ctx = canvas.getContext('2d');
+
+    // 物理与系统常量
+    const dt = 1/60; // 物理步长
+    const g = 9.81 * 20; // 放大重力以获得更好的视觉效果
+    const m = 15; // 车轮及悬挂组件的非簧载质量
+    const k = 800; // 弹簧刚度 (Hooke's Law)
+    const c = 80; // 阻尼系数
+
+    // 车身(固定参考系)和车轮(动态)
+    const chassis = {
+        x: 200,
+        y: 200,
+        width: 150,
+        height: 100
+    };
+
+    const wheel = {
+        x: 450,
+        y: 350,
+        vy: 0,
+        radius: 65,
+        restY: 380, // 平衡位置
+        rotation: 0
+    };
+
+    // 锚点设置 (用于双叉臂和避震器)
+    const upperMountC = { x: 350, y: 180 }; // 车身侧上叉臂锚点
+    const lowerMountC = { x: 350, y: 280 }; // 车身侧下叉臂锚点
+    const shockMountC = { x: 300, y: 130 }; // 车身侧避震器顶部锚点
+
+    // 粒子系统
+    let particles = [];
+    let scrollX = 0;
+    const speed = 18; // 行驶速度 (px/frame)
+
+    // 伪随机地形生成函数
+    function getTerrainY(x) {
+        let rx = x + scrollX;
+        let base = 500;
+        // 缓和起伏
+        base += Math.sin(rx * 0.003) * 30;
+        // 颠簸路面
+        base += Math.sin(rx * 0.02) * 15;
+        // 尖锐岩石/突起地形
+        let rock = Math.pow(Math.sin(rx * 0.06), 16) * 40;
+        return base - rock;
+    }
+
+    // 触发火花与尘土
+    function spawnParticles(x, y, intensity) {
+        // 尘土
+        for (let i = 0; i < 3 + intensity * 0.1; i++) {
+            particles.push({
+                type: 'dust',
+                x: x + (Math.random() - 0.5) * 40,
+                y: y + 20,
+                vx: -speed * 0.5 + (Math.random() - 0.5) * 2,
+                vy: (Math.random() - 1) * 3,
+                life: 1.0,
+                size: Math.random() * 15 + 10
+            });
+        }
+        // 火花 (仅在猛烈撞击时)
+        if (intensity > 20) {
+            for (let i = 0; i < intensity * 0.3; i++) {
+                particles.push({
+                    type: 'spark',
+                    x: x + Math.random() * 20 - 10,
+                    y: y + 30,
+                    vx: -speed * 0.8 + (Math.random() - 0.5) * 8,
+                    vy: -Math.random() * 10 - 5,
+                    life: 1.0,
+                    size: Math.random() * 2 + 1
+                });
+            }
+        }
+    }
+
+    // 更新物理状态
+    function updatePhysics() {
+        // 弹簧形变量 (x)
+        let displacement = wheel.y - wheel.restY;
+        
+        // 物理定律计算
+        let springForce = -k * displacement;          // Hooke's Law: F = -kx
+        let dampingForce = -c * wheel.vy;             // Viscous Damping: F = -cv
+        let netForce = springForce + dampingForce + (m * g);
+
+        // 欧拉积分
+        let acceleration = netForce / m;
+        wheel.vy += acceleration * dt;
+        wheel.y += wheel.vy * dt;
+
+        // 车轮旋转
+        wheel.rotation += speed / wheel.radius;
+
+        // 地形碰撞检测
+        let groundY = getTerrainY(wheel.x);
+        let penetration = (wheel.y + wheel.radius) - groundY;
+
+        if (penetration > 0) {
+            wheel.y = groundY - wheel.radius; // 修正位置防止穿模
+            let impactVelocity = wheel.vy;
+            
+            // 撞击时削减向下的速度，模拟地面反作用力
+            if (wheel.vy > 0) wheel.vy = -wheel.vy * 0.1; 
+            
+            // 爬坡时的垂直速度施加
+            let nextGroundY = getTerrainY(wheel.x + speed);
+            let slope = nextGroundY - groundY;
+            if (slope < 0) {
+                wheel.vy = Math.min(wheel.vy, slope); 
+            }
+
+            // 粒子触发逻辑
+            spawnParticles(wheel.x, groundY, impactVelocity + Math.abs(slope));
+        }
+
+        // 更新UI面板
+        document.getElementById('stat-speed').innerText = `模拟车速: ${Math.round(speed * 3.6)} km/h`;
+        document.getElementById('stat-compress').innerText = `弹簧形变 (x): ${(-displacement/100).toFixed(3)} m`;
+        document.getElementById('stat-spring').innerHTML = `弹簧弹力 (F = -kx): <span class="highlight">${Math.round(springForce)} N</span>`;
+        document.getElementById('stat-damper').innerHTML = `阻尼力 (F = -cv): <span class="highlight-blue">${Math.round(dampingForce)} N</span>`;
+
+        scrollX += speed;
+    }
+
+    // 绘制车身组件
+    function drawChassis() {
+        ctx.fillStyle = '#2c3e50';
+        ctx.fillRect(chassis.x, chassis.y, chassis.width, chassis.height);
+        
+        // 绘制悬挂挂载结构
+        ctx.fillStyle = '#34495e';
+        ctx.beginPath();
+        ctx.moveTo(chassis.x + chassis.width, chassis.y + 20);
+        ctx.lineTo(upperMountC.x + 20, upperMountC.y - 20);
+        ctx.lineTo(lowerMountC.x + 20, lowerMountC.y + 20);
+        ctx.lineTo(chassis.x + chassis.width, chassis.y + chassis.height - 20);
+        ctx.fill();
+    }
+
+    // 绘制双叉臂
+    function drawWishbones(upperMountW, lowerMountW) {
+        ctx.lineWidth = 12;
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = '#7f8c8d';
+
+        // 上叉臂
+        ctx.beginPath();
+        ctx.moveTo(upperMountC.x, upperMountC.y);
+        ctx.lineTo(upperMountW.x, upperMountW.y);
+        ctx.stroke();
+
+        // 下叉臂
+        ctx.beginPath();
+        ctx.moveTo(lowerMountC.x, lowerMountC.y);
+        ctx.lineTo(lowerMountW.x, lowerMountW.y);
+        ctx.stroke();
+
+        // 转向节 (连接上下叉臂)
+        ctx.lineWidth = 15;
+        ctx.strokeStyle = '#bdc3c7';
+        ctx.beginPath();
+        ctx.moveTo(upperMountW.x, upperMountW.y);
+        ctx.lineTo(lowerMountW.x, lowerMountW.y);
+        ctx.stroke();
+    }
+
+    // 绘制避震器与弹簧剖面
+    function drawShockAbsorber(shockMountW) {
+        let dx = shockMountW.x - shockMountC.x;
+        let dy = shockMountW.y - shockMountC.y;
+        let len = Math.sqrt(dx*dx + dy*dy);
+        let angle = Math.atan2(dy, dx);
+
+        ctx.save();
+        ctx.translate(shockMountC.x, shockMountC.y);
+        ctx.rotate(angle);
+
+        // 1. 绘制外部缸筒 (包含液压油剖面)
+        let tubeLen = 140;
+        let tubeWidth = 24;
+        
+        // 缸筒壁
+        ctx.fillStyle = 'rgba(52, 73, 94, 0.9)';
+        ctx.fillRect(0, -tubeWidth/2, tubeLen, tubeWidth);
+        
+        // 液压油 (蓝色剖面)
+        ctx.fillStyle = 'rgba(52, 152, 219, 0.6)';
+        ctx.fillRect(2, -tubeWidth/2 + 2, tubeLen - 4, tubeWidth - 4);
+
+        // 2. 绘制内部活塞杆
+        let rodLen = len - tubeLen + 60; 
+        ctx.fillStyle = '#bdc3c7';
+        // 杆体
+        ctx.fillRect(len - rodLen, -4, rodLen, 8);
+
+        // 3. 绘制活塞头 (带有微小阻尼阀门孔)
+        let pistonX = len - rodLen;
+        ctx.fillStyle = '#2c3e50';
+        ctx.fillRect(pistonX, -tubeWidth/2 + 2, 12, tubeWidth - 4);
+        // 微小阀门孔 (发光表示油液通过)
+        ctx.fillStyle = '#e0f7fa';
+        ctx.fillRect(pistonX + 4, -tubeWidth/2 + 6, 4, 3);
+        ctx.fillRect(pistonX + 4, tubeWidth/2 - 9, 4, 3);
+
+        // 4. 绘制螺旋弹簧 (波浪线环绕)
+        ctx.strokeStyle = '#e74c3c';
+        ctx.lineWidth = 8;
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        let coils = 8;
+        let springStart = 20;
+        let springEnd = len - 20;
+        let steps = 100;
+        for (let i = 0; i <= steps; i++) {
+            let t = i / steps;
+            let currentX = springStart + t * (springEnd - springStart);
+            let waveY = Math.sin(t * coils * Math.PI * 2) * (tubeWidth/2 + 10);
+            if (i === 0) ctx.moveTo(currentX, waveY);
+            else ctx.lineTo(currentX, waveY);
+        }
+        ctx.stroke();
+
+        ctx.restore();
+    }
+
+    // 绘制车轮
+    function drawWheel() {
+        ctx.save();
+        ctx.translate(wheel.x, wheel.y);
+        ctx.rotate(wheel.rotation);
+
+        // 轮胎
+        ctx.beginPath();
+        ctx.arc(0, 0, wheel.radius, 0, Math.PI * 2);
+        ctx.fillStyle = '#222';
+        ctx.fill();
+        ctx.lineWidth = 6;
+        ctx.strokeStyle = '#111';
+        ctx.stroke();
+
+        // 轮毂
+        ctx.beginPath();
+        ctx.arc(0, 0, wheel.radius * 0.6, 0, Math.PI * 2);
+        ctx.fillStyle = '#7f8c8d';
+        ctx.fill();
+
+        // 轮辐
+        ctx.strokeStyle = '#bdc3c7';
+        ctx.lineWidth = 10;
+        for (let i = 0; i < 5; i++) {
+            ctx.beginPath();
+            ctx.moveTo(0, 0);
+            ctx.lineTo(0, -wheel.radius * 0.6);
+            ctx.stroke();
+            ctx.rotate((Math.PI * 2) / 5);
+        }
+
+        ctx.restore();
+    }
+
+    // 渲染粒子
+    function drawParticles() {
+        for (let i = particles.length - 1; i >= 0; i--) {
+            let p = particles[i];
+            p.x += p.vx;
+            p.y += p.vy;
+            p.life -= 0.02;
+
+            if (p.type === 'spark') {
+                p.vy += 0.5; // 火花受重力影响更大
+                ctx.fillStyle = `rgba(255, 165, 0, ${p.life})`;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.size, 0, Math.PI*2);
+                ctx.fill();
+            } else if (p.type === 'dust') {
+                p.size += 0.5; // 尘土扩散
+                ctx.fillStyle = `rgba(139, 115, 85, ${p.life * 0.5})`;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.size, 0, Math.PI*2);
+                ctx.fill();
+            }
+
+            if (p.life <= 0) particles.splice(i, 1);
+        }
+    }
+
+    // 渲染地形
+    function drawTerrain() {
+        ctx.fillStyle = '#5c4033';
+        ctx.beginPath();
+        ctx.moveTo(0, canvas.height);
+        for (let x = 0; x <= canvas.width; x += 10) {
+            ctx.lineTo(x, getTerrainY(x));
+        }
+        ctx.lineTo(canvas.width, canvas.height);
+        ctx.fill();
+        
+        // 地形顶部高光/纹理层
+        ctx.strokeStyle = '#8b5a2b';
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        for (let x = 0; x <= canvas.width; x += 10) {
+            if (x===0) ctx.moveTo(x, getTerrainY(x));
+            else ctx.lineTo(x, getTerrainY(x));
+        }
+        ctx.stroke();
+    }
+
+    // 主渲染循环
+    function loop() {
+        // 清理画布
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // 计算当前车轮侧的悬挂锚点位置
+        const upperMountW = { x: wheel.x, y: wheel.y - 30 };
+        const lowerMountW = { x: wheel.x, y: wheel.y + 30 };
+        const shockMountW = { x: wheel.x - 20, y: wheel.y + 15 };
+
+        // 1. 物理计算
+        updatePhysics();
+
+        // 2. 渲染背景与地形
+        drawTerrain();
+
+        // 3. 渲染车辆组件
+        drawChassis();
+        drawWishbones(upperMountW, lowerMountW);
+        drawShockAbsorber(shockMountW);
+        drawWheel();
+
+        // 4. 渲染粒子效果
+        drawParticles();
+
+        requestAnimationFrame(loop);
+    }
+
+    // 启动动画
+    loop();
+</script>
+</body>
+</html>
